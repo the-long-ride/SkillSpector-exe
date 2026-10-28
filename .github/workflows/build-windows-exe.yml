@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Build Windows single EXE
+
+on:
+  push:
+    branches:
+      - build/windows-single-exe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-single-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and smoke-test Windows x64 EXE
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      UV_LINK_MODE: copy
+      UV_PYTHON: "3.12"
+      PYTHONUTF8: "1"
+      LANGSMITH_TRACING: "false"
+      LANGCHAIN_TRACING_V2: "false"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.10.10"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked app and MCP dependencies
+        shell: pwsh
+        run: uv sync --locked --extra mcp --no-dev
+
+      - name: Install pinned Windows freezer
+        shell: pwsh
+        run: uv pip install --python ".venv/Scripts/python.exe" "pyinstaller==6.22.3"
+
+      - name: Package as one console executable
+        shell: pwsh
+        run: |
+          & ".venv/Scripts/python.exe" -m PyInstaller --clean --noconfirm --distpath dist --workpath build/pyinstaller packaging/skillspector.spec
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed" }
+          $exe = Get-Item -LiteralPath "dist/SkillSpector.exe" -ErrorAction Stop
+          if ($exe.Length -lt 1000000) { throw "Built executable is unexpectedly small" }
+          $executables = @(Get-ChildItem -LiteralPath dist -Filter "*.exe" -File)
+          if ($executables.Count -ne 1) { throw "Expected exactly one executable in dist" }
+
+      - name: Smoke-test packaged EXE from a directory with spaces
+        shell: pwsh
+        run: |
+          $testDir = Join-Path $env:RUNNER_TEMP "Skill Spector standalone test"
+          New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+          $exe = Join-Path $testDir "SkillSpector.exe"
+          Copy-Item -LiteralPath "dist/SkillSpector.exe" -Destination $exe -Force
+          $versionOutput = (& $exe --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch "SkillSpector") { throw "Version smoke test failed: $versionOutput" }
+          $helpOutput = (& $exe --help 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $helpOutput -notmatch "scan") { throw "Help smoke test failed: $helpOutput" }
+          $fixture = (Resolve-Path "tests/fixtures/safe_skill").Path
+          # Windows intentionally disables SkillSpector's --output to prevent
+          # unsafe writes. Capture stdout instead; do not bypass this protection.
+          $scanJson = (& $exe scan $fixture --no-llm --format json | Out-String)
+          if ($LASTEXITCODE -ne 0) { throw "Offline scan smoke test exited with $LASTEXITCODE" }
+          $report = $scanJson | ConvertFrom-Json -ErrorAction Stop
+          # Match the CLI's canonical report schema, not the internal graph state.
+          $assessment = $report.risk_assessment
+          if ($null -eq $assessment -or $null -eq $assessment.score -or
+              $assessment.score -isnot [ValueType] -or
+              $assessment.score -lt 0 -or $assessment.score -gt 100) {
+            throw "Invalid JSON risk_assessment.score in packaged EXE output"
+          }
+          if ([string]::IsNullOrWhiteSpace($report.skill.name) -or
+              $null -eq $report.issues -or $null -eq $report.analysis_completeness) {
+            throw "Packaged EXE did not emit the expected SkillSpector report structure"
+          }
+          # Regress the security contract: --output must remain disabled on Windows.
+          $unsupportedOutput = (& $exe scan $fixture --no-llm --format json --output (Join-Path $testDir "report.json") 2>&1 | Out-String)
+          $refusalExitCode = $LASTEXITCODE
+          if ($refusalExitCode -ne 2 -or $unsupportedOutput -notmatch "Safe file output is unsupported") {
+            throw "Windows safe-file-output refusal regression (exit $refusalExitCode): $unsupportedOutput"
+          }
+          # The deliberately rejected command returned 2. GitHub's pwsh wrapper
+          # observes LASTEXITCODE even after successful PowerShell statements.
+          # After validating the expected failure, finish this step explicitly.
+          Write-Host "Packaged EXE smoke tests passed"
+          exit 0
+
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -LiteralPath "dist/SkillSpector.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash *SkillSpector.exe" | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding ascii
+          Write-Host "SHA256: $hash"
+
+      - name: Upload standalone executable and notices
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: SkillSpector-windows-x64-onefile
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/SkillSpector.exe
+            dist/SHA256SUMS.txt
+            LICENSE
+            THIRD_PARTY_NOTICES.md
